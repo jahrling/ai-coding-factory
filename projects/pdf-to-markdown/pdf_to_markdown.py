@@ -95,6 +95,18 @@ SAVE_MARGIN_CROPS = True     # write each crop PNG for spot-checking the framing
 MARGIN_SECTION_TITLE = "Sidebar Stories"   # heading used when folding
 NO_MARGIN_SENTINEL = "(no margin content)"
 
+# --- De-hyphenation ---------------------------------------------------------
+# Line-break hyphens ("impres-\nsion") are fused back into whole words in every
+# transcription and across the page seam when folding. Only a hyphen sitting
+# immediately before a newline is treated as an artifact; inline hyphens
+# (self-esteem) are never touched. A reference vocabulary built from the PDF's
+# own text layer protects genuine compounds: the hyphen is kept when fusing
+# would create a non-word but both halves are real words (so "well-\nknown"
+# -> "well-known", not "wellknown"). Always on; no CLI flag. With no text
+# layer it degrades to a plain broad join.
+DEHYPHENATE = True
+_VOCAB = frozenset()   # populated per run in main() from the PDF text layer
+
 
 PROMPT = """You are transcribing ONE page from a scanned book into clean Markdown. \
 Read the whole page image and reproduce its text exactly.
@@ -239,6 +251,47 @@ WORD_RE = re.compile(r"[A-Za-z0-9']+")
 
 def _words(text):
     return WORD_RE.findall(text.lower())
+
+
+# ----------------------------------------------------------------------------
+# De-hyphenation
+# ----------------------------------------------------------------------------
+# A word fragment, a hyphen, a single newline (optionally through a blockquote
+# "> " continuation marker), then a lowercase continuation. The single newline
+# keeps us inside one paragraph — a blank line (paragraph break) never matches,
+# so distinct paragraphs and list items are safe. Digits are excluded, so
+# number ranges like "1620-\n1705" are left alone.
+DEHYPH_RE = re.compile(r"([A-Za-z]+)-[ \t]*\n[ \t]*(?:>[ \t]*)?([a-z][A-Za-z]*)")
+
+
+def build_vocab(doc):
+    """Lowercase word set from the whole PDF text layer, used only to tell a
+    soft line-break hyphen from a genuine compound. Content accuracy does not
+    matter here — just which words exist somewhere in the book."""
+    vocab = set()
+    for i in range(doc.page_count):
+        for w in WORD_RE.findall(doc.load_page(i).get_text().lower()):
+            if w.isalpha() and len(w) >= 2:
+                vocab.add(w)
+    return frozenset(vocab)
+
+
+def _fuse_or_keep(left, right):
+    """Decide how to resolve a line-break hyphen between `left` and `right`."""
+    fused = left + right
+    if _VOCAB:
+        if fused.lower() in _VOCAB:
+            return fused                       # clearly one word -> fuse
+        if left.lower() in _VOCAB and right.lower() in _VOCAB:
+            return f"{left}-{right}"            # genuine compound -> keep hyphen
+    return fused                               # default (and no-vocab): fuse
+
+
+def dehyphenate(text):
+    """Fuse soft line-break hyphens across the whole text. Idempotent."""
+    if not DEHYPHENATE or not text:
+        return text
+    return DEHYPH_RE.sub(lambda m: _fuse_or_keep(m.group(1), m.group(2)), text)
 
 
 def qa_flags(transcription, pdf_text):
@@ -387,6 +440,7 @@ def run_body(doc, pages, output_path, log, flag_path):
             pdf_text = page.get_text()
             png = render_page_png(page)
             transcription = transcribe_image(png, log, PROMPT)
+            transcription = dehyphenate(transcription)
             append_page(output_path, page_num, transcription)
 
             reasons = qa_flags(transcription, pdf_text)
@@ -442,9 +496,11 @@ def run_margins(doc, pages, margins_path, crops_dir, log):
                 with open(os.path.join(crops_dir, f"p{page_num}.png"), "wb") as f:
                     f.write(png)
             transcription = transcribe_image(png, log, MARGIN_PROMPT)
+            empty = transcription.strip() == NO_MARGIN_SENTINEL
+            if not empty:
+                transcription = dehyphenate(transcription)
             append_page(margins_path, page_num, transcription)
 
-            empty = transcription.strip() == NO_MARGIN_SENTINEL
             words = len(_words(transcription))
             dt = time.time() - t0
             note = "  (empty)" if empty else f"  words={words}"
@@ -538,19 +594,30 @@ def fold_margins(doc, body_path, margins_path, merged_path, log):
     started = False
 
     def flush():
-        if bucket:
-            section = (
-                f"## {MARGIN_SECTION_TITLE}\n\n"
-                + "\n\n".join(bucket)
-                + "\n\n---\n\n"
-            )
-            out.append(section)
-            bucket.clear()
+        if not bucket:
+            return
+        # Assemble the chapter's sidebar fragments. When a fragment ends with a
+        # letter+hyphen, the story continues onto the next page's fragment, so
+        # join them with a single newline (not a blank line) and let
+        # dehyphenate() fuse the split word across the seam; otherwise keep the
+        # blank line between distinct items.
+        parts = []
+        for frag in bucket:
+            frag = frag.strip()
+            if parts and re.search(r"[A-Za-z]-\s*$", parts[-1]):
+                parts[-1] = parts[-1].rstrip() + "\n" + frag
+            else:
+                parts.append(frag)
+        section_body = dehyphenate("\n\n".join(parts))
+        out.append(f"## {MARGIN_SECTION_TITLE}\n\n{section_body}\n\n---\n\n")
+        bucket.clear()
 
     for num, body in body_blocks:
         if started and num in start_set:
             flush()  # close out the previous chapter's sidebars
-        out.append(f"<!-- page {num} -->\n\n{body}\n\n---\n\n")
+        # Also clean the body on merge, so an existing run made before
+        # de-hyphenation existed still comes out clean without re-transcribing.
+        out.append(f"<!-- page {num} -->\n\n{dehyphenate(body)}\n\n---\n\n")
         started = True
         if num in margins:
             bucket.append(margins[num])
@@ -618,6 +685,12 @@ def main():
 
     doc = fitz.open(args.input_pdf)
     total_pages = doc.page_count
+
+    global _VOCAB
+    if DEHYPHENATE:
+        _VOCAB = build_vocab(doc)
+        log(f"De-hyphenation on; compound-guard vocab={len(_VOCAB)} words "
+            f"from the PDF text layer")
 
     if args.fold_margins:
         log(f"FOLD  body={output_path}  margins={margins_path}  -> {merged_path}")

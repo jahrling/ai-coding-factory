@@ -159,12 +159,31 @@ The QA net also catches this automatically: a truncated page trips the
 > synthetic two-column PDF with a bookmark TOC; the crop framing itself needs
 > your eyes on `power.margins_crops/pN.png`.
 
+## De-hyphenation (always on)
+
+Scanned prose breaks words across lines with a hyphen (`impres-\nsion`). These
+soft hyphens are fused back into whole words automatically — in every body and
+margin transcription, and **across the page seam** when folding (a sidebar
+story that splits `…impres-` / `sion…` across two pages is rejoined into
+`impression`).
+
+Only a hyphen sitting **immediately before a newline** is treated as an
+artifact; inline hyphens (`self-esteem`) are never touched. The one genuine
+ambiguity — a real compound that happens to break at its hyphen (`well-\nknown`)
+— is resolved with a reference vocabulary built from **the PDF's own text
+layer**: the hyphen is kept when fusing would make a non-word but both halves
+are real words. So `over-\nwhelm` → `overwhelm` (fused) but `well-\nknown` →
+`well-known` (kept). No external dictionary; if the PDF has no text layer it
+degrades to a plain broad join. Controlled by `DEHYPHENATE = True` at the top of
+the script — it's a constant, not a CLI flag. Running `--fold-margins` on a
+body file produced before this existed cleans it up without re-transcribing.
+
 ## Tunable constants (top of `pdf_to_markdown.py`)
 
 `MODEL`, `OLLAMA_URL`, `NUM_CTX`, `NUM_PREDICT`, `MAX_IMAGE_DIM` (longest
 image side in px; oversized images can cause a bare HTTP 400), `RETRY_COUNT`,
-`RETRY_BACKOFF`, and the two QA thresholds `QA_LENGTH_RATIO_THRESHOLD` /
-`QA_WORD_OVERLAP_THRESHOLD`.
+`RETRY_BACKOFF`, the two QA thresholds `QA_LENGTH_RATIO_THRESHOLD` /
+`QA_WORD_OVERLAP_THRESHOLD`, the margin crop settings, and `DEHYPHENATE`.
 
 ## Robustness (how an overnight run survives)
 
